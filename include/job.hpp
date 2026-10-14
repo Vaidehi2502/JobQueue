@@ -65,10 +65,17 @@ struct Job {
     JobState state = JobState::Queued;
     int attempts = 0;        // completed execution attempts so far
     int max_attempts = 1;    // total attempts allowed before permanent failure
+    int priority = 0;        // higher runs first among eligible jobs
+    int64_t timeout_ms = 0;  // per-attempt time budget; 0 = no timeout
     int64_t available_at = 0;  // epoch ms; job is eligible once now >= this
     int64_t created_at = 0;    // epoch ms at submission
     int64_t updated_at = 0;    // epoch ms of last state change
     std::string last_error;
+
+    // Wall-clock deadline for the current attempt, set by a worker at claim
+    // time when timeout_ms > 0 (0 means no deadline). Handlers may read this to
+    // cooperatively abort long work; the queue also enforces it with a watchdog.
+    int64_t deadline_ms = 0;
 };
 
 // Registered per job type. Runs outside any queue lock. Should be idempotent

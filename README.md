@@ -16,8 +16,14 @@ This project implements a single-machine job queue with thread-safe scheduling, 
 - **Job lifecycle management:** Tracks queued, running, completed, and failed jobs.
 - **Retry mechanism:** Supports bounded retries with exponential backoff.
 - **Delayed scheduling:** Allows jobs to become eligible for execution at a specified time.
+- **Priorities:** Higher-priority jobs are claimed first among eligible work.
+- **Per-job timeouts:** A watchdog detects attempts that exceed their budget and retries/fails them.
+- **Bounded capacity + backpressure:** Optional cap on pending jobs; submitters block or are refused when full.
 - **Crash recovery:** Reconstructs pending work from persistent records after restart.
 - **Graceful shutdown:** Coordinates worker termination and resource cleanup.
+- **Structured logging:** Optional pluggable logfmt sink for lifecycle events.
+- **Operational metrics:** Counters + latency percentiles, exported as Prometheus text or JSON.
+- **HTTP API:** Optional REST front end for submission and status (cpp-httplib).
 - **Performance benchmarking:** Measures throughput and queue latency.
 - **Automated testing:** Validates queue behavior, concurrency, and recovery scenarios.
 
@@ -64,10 +70,12 @@ flowchart TD
 | CMake            | Build configuration                                    |
 | GCC / G++        | Compilation                                            |
 | GoogleTest       | Unit and integration testing (fetched via CMake)       |
+| cpp-httplib      | HTTP server + client for the optional REST API         |
+| nlohmann/json    | JSON request/response bodies                           |
 | ThreadSanitizer  | Detecting data races                                   |
 | AddressSanitizer | Detecting memory safety errors                         |
 
-The core engine (`libjobqueue`) is independent of any frontend. An HTTP API can be layered on top without changing it.
+The core engine (`libjobqueue`) is independent of any frontend. The HTTP layer (`libjobqueue_http`) is a thin, optional front end built on top of it and can be disabled entirely with `-DJOBQ_BUILD_HTTP=OFF`.
 
 ## Project Structure
 
@@ -75,18 +83,23 @@ The core engine (`libjobqueue`) is independent of any frontend. An HTTP API can 
 cpp-job-queue/
 ├── include/
 │   ├── job.hpp          # Job, JobState, JobResult, RetryPolicy, handler types
-│   ├── job_store.hpp    # SQLite persistence layer (thread-safe)
-│   └── job_queue.hpp    # Queue engine + worker pool + metrics
+│   ├── job_store.hpp    # SQLite persistence layer (thread-safe, cached stmts)
+│   ├── job_queue.hpp    # Queue engine + worker pool + logging + metrics
+│   └── http_server.hpp  # optional HTTP front end (pimpl)
 ├── src/
 │   ├── job.cpp          # state strings, backoff computation
-│   ├── job_store.cpp    # SQLite schema, atomic claim, recovery
-│   ├── job_queue.cpp    # worker loop, retry handling, shutdown, metrics
-│   └── main.cpp         # demonstration CLI
+│   ├── job_store.cpp    # SQLite schema, atomic claim, timeouts, recovery
+│   ├── job_queue.cpp    # worker loop, retries, watchdog, capacity, metrics
+│   ├── http_server.cpp  # HTTP routes (cpp-httplib + nlohmann/json)
+│   ├── main.cpp         # demonstration CLI
+│   └── server_main.cpp  # HTTP server entry point
 ├── tests/
 │   ├── test_util.hpp            # self-cleaning temp-DB helper
 │   ├── job_queue_tests.cpp      # lifecycle, retries, delays, failures
 │   ├── concurrency_tests.cpp    # many producers/workers, exactly-once
-│   └── recovery_tests.cpp       # persistence + restart recovery
+│   ├── recovery_tests.cpp       # persistence + restart recovery
+│   ├── features_tests.cpp       # priorities, timeouts, capacity, metrics
+│   └── http_tests.cpp           # HTTP API integration tests
 ├── benchmarks/
 │   └── benchmark.cpp
 ├── CMakeLists.txt
@@ -113,25 +126,72 @@ using namespace jobq;
 
 JobQueue queue("jobs.db");               // ":memory:" for an ephemeral store
 
+queue.set_capacity(10'000);              // optional: bound pending jobs (backpressure)
+queue.set_logger(make_stderr_logger());  // optional: structured logfmt logging
+
 queue.register_handler("email", [](const Job& j) {
     if (!send_email(j.payload)) return JobResult::retry("smtp timeout");
     return JobResult::success();
 });
 
-queue.start(4);                          // runs crash recovery, spawns 4 workers
+queue.start(4);                          // runs crash recovery, spawns workers + watchdog
 
 int64_t id = queue.submit("email", R"({"to":"a@b.com"})");
 
 SubmitOptions opts;
 opts.max_attempts = 5;
 opts.delay = std::chrono::seconds(30);   // delayed scheduling
+opts.priority = 10;                      // higher runs first
+opts.timeout = std::chrono::seconds(60); // per-attempt budget (0 = none)
 queue.submit("email", payload, opts);
+
+auto maybe_id = queue.try_submit("email", payload, opts);  // nullopt if at capacity
 
 queue.drain();                           // wait until no work remains (optional)
 queue.shutdown();                        // graceful stop + join
 ```
 
 A handler returns one of `JobResult::success()`, `JobResult::retry(msg)`, or `JobResult::fail(msg)`. Exceptions thrown from a handler are caught and treated as retryable failures. An unknown job type fails permanently rather than spin-claiming.
+
+### Priorities, timeouts, and capacity
+
+- **Priority:** `claim_next` orders eligible jobs by `priority DESC, available_at ASC, id ASC`, so higher-priority work runs first.
+- **Timeout:** when `timeout > 0`, a worker stamps a deadline at claim time and a watchdog thread periodically requeues/fails attempts that overrun it. **A timeout does not kill the in-flight handler** — C++ threads cannot be safely cancelled — it only makes the job eligible again, so the handler may run again concurrently. Resolution is guarded (`WHERE state='running' AND attempts=?`), so the superseded attempt's result is discarded. Handlers that do external work must be idempotent, and may read `Job::deadline_ms` to abort cooperatively.
+- **Capacity:** with `set_capacity(n)`, at most `n` jobs may be pending (queued + running). `submit()` blocks until a slot frees (backpressure); `try_submit()` returns `std::nullopt` instead. `0` (default) is unbounded.
+
+## HTTP API
+
+Build enables `job_queue_server` by default. Start it and talk JSON:
+
+```bash
+./build/job_queue_server [db_path] [port] [num_workers]   # defaults: jobs.db 8080 4
+```
+
+| Method & path        | Purpose                        | Responses              |
+| -------------------- | ------------------------------ | ---------------------- |
+| `POST /jobs`         | Submit a job (JSON body)       | `201` job · `400` · `503` full |
+| `GET /jobs/{id}`     | Fetch one job                  | `200` · `404`          |
+| `GET /jobs?state=&limit=` | List jobs (optional filter) | `200`                  |
+| `GET /stats`         | Per-state counts               | `200`                  |
+| `GET /metrics`       | Prometheus exposition text     | `200` (text/plain)     |
+| `GET /metrics.json`  | Metrics as JSON                | `200`                  |
+| `GET /healthz`       | Liveness                       | `200` (text/plain)     |
+
+Submission body (only `type` is required):
+
+```json
+{ "type": "email", "payload": "...", "max_attempts": 3,
+  "delay_ms": 0, "priority": 0, "timeout_ms": 0 }
+```
+
+`payload` may be a string (stored verbatim) or any JSON value (serialized). The server uses `try_submit`, so a full queue returns `503` rather than blocking the request thread.
+
+```bash
+curl -XPOST localhost:8080/jobs -d '{"type":"email","payload":"hi","priority":5}'
+curl localhost:8080/jobs/1
+curl localhost:8080/stats
+curl localhost:8080/metrics
+```
 
 ## Reliability and Failure Handling
 
@@ -173,7 +233,11 @@ sudo apt update
 sudo apt install build-essential cmake git sqlite3 libsqlite3-dev
 ```
 
-GoogleTest is fetched automatically by CMake if it is not already installed (requires network on first configure; disable with `-DJOBQ_BUILD_TESTS=OFF`).
+CMake fetches a few dependencies on first configure (requires network): **GoogleTest** (unless already installed), and — when the HTTP API is enabled — the single-header **cpp-httplib** and **nlohmann/json**. Relevant options:
+
+- `-DJOBQ_BUILD_TESTS=OFF` — skip tests (and GoogleTest).
+- `-DJOBQ_BUILD_HTTP=OFF` — skip the HTTP server (and its downloads); builds fully offline.
+- `-DJOBQ_BUILD_BENCHMARKS=OFF` — skip the benchmark executable.
 
 ### Build
 
@@ -185,10 +249,11 @@ cmake --build build -j
 ### Run
 
 ```bash
-./build/job_queue [db_path] [num_workers]      # defaults: jobs.db 4
+./build/job_queue [db_path] [num_workers]          # CLI demo; defaults: jobs.db 4
+./build/job_queue_server [db_path] [port] [workers] # HTTP server; defaults: jobs.db 8080 4
 ```
 
-The CLI registers example handlers (`print`, `flaky`, `doomed`), submits a mix of jobs including a delayed one and a retrying one, drains the queue, and prints a summary. Re-running against the same `db_path` shows prior jobs and recovers any left behind.
+The CLI registers example handlers (`print`, `flaky`, `doomed`), submits a mix of jobs including a delayed one and a retrying one, drains the queue, and prints a summary. Re-running against the same `db_path` shows prior jobs and recovers any left behind. The server exposes the [HTTP API](#http-api) and logs lifecycle events in logfmt.
 
 ## Testing
 
@@ -201,8 +266,10 @@ Test categories:
 - **Functional** (`job_queue_tests.cpp`): submission, lifecycle transitions, retry success/exhaustion, permanent failure, unknown-type failure, handler exceptions, delayed scheduling, backoff math.
 - **Concurrency** (`concurrency_tests.cpp`): many producers and workers, exactly-once execution (no job runs twice), shutdown while submitting.
 - **Recovery** (`recovery_tests.cpp`): state survives restart, queued work resumes, interrupted `running` jobs are requeued and finished.
+- **Features** (`features_tests.cpp`): priority ordering, per-job timeouts (single-attempt and retry-then-exhaust), capacity rejection and backpressure, metrics export.
+- **HTTP** (`http_tests.cpp`): submit/fetch/list/filter, bad-request and not-found handling, `503` at capacity, metrics endpoints — exercised over a real TCP client.
 
-All 16 tests currently pass.
+All 29 tests currently pass.
 
 ### Sanitizer Checks
 
@@ -232,13 +299,13 @@ The harness runs a no-op handler against both an in-memory and an on-disk store 
 
 | Metric               | In-memory store | On-disk store (WAL) |
 | -------------------- | --------------- | ------------------- |
-| Throughput           | ~6,200 jobs/s   | ~2,900 jobs/s       |
+| Throughput           | ~17,200 jobs/s  | ~4,750 jobs/s       |
 | p50 queue latency    | ~0 ms           | ~0 ms               |
-| p95 queue latency    | ~1 ms           | ~1 ms               |
-| p99 queue latency    | ~5 ms           | ~10 ms              |
-| Persistence overhead | baseline        | ~2.1× slower        |
+| p95 queue latency    | ~0 ms           | ~1 ms               |
+| p99 queue latency    | ~1 ms           | ~8 ms               |
+| Persistence overhead | baseline        | ~3.6× slower        |
 
-Throughput is `completed jobs / elapsed seconds`; queue latency is the time from a job becoming eligible (`available_at`) to a worker claiming it. These numbers are specific to the hardware and settings above and will vary. A known optimization opportunity is caching prepared SQLite statements per connection rather than preparing per operation.
+Throughput is `completed jobs / elapsed seconds`; queue latency is the time from a job becoming eligible (`available_at`) to a worker claiming it. These numbers are specific to the hardware and settings above and will vary. Caching prepared statements (now implemented) roughly tripled in-memory throughput versus preparing per operation; the on-disk path is dominated by WAL fsyncs, and the remaining bottleneck is the single writer connection — see the roadmap for splitting it across per-connection statement caches.
 
 ## Design Decisions
 
@@ -265,11 +332,14 @@ Throughput is `completed jobs / elapsed seconds`; queue latency is the time from
 - [x] Startup recovery and graceful shutdown.
 - [x] Functional, concurrency, and recovery tests (+ ThreadSanitizer).
 - [x] Benchmark suite (throughput, latency, persistence overhead).
-- [ ] Optional HTTP API and job-status endpoints.
-- [ ] Job priorities and per-job timeouts.
-- [ ] Bounded queue capacity and backpressure.
-- [ ] Prepared-statement caching for higher throughput.
-- [ ] Structured logging and operational metrics export.
+- [x] Optional HTTP API and job-status endpoints.
+- [x] Job priorities and per-job timeouts.
+- [x] Bounded queue capacity and backpressure.
+- [x] Prepared-statement caching for higher throughput.
+- [x] Structured logging and operational metrics export.
+- [ ] Per-connection statement caching across multiple SQLite connections (reduce the single-writer bottleneck).
+- [ ] Authentication / rate limiting for the HTTP API.
+- [ ] Graceful cancellation of eligible (not-yet-running) jobs.
 
 ## Learning Outcomes
 
